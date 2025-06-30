@@ -10,11 +10,14 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
+#include <future>
 #include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <csignal>
 #include <atomic>
 #include <functional>
@@ -128,6 +131,13 @@ struct whisper_params {
     float       vad_max_speech_duration_s = FLT_MAX;
     int         vad_speech_pad_ms = 30;
     float       vad_samples_overlap = 0.1f;
+};
+
+struct StreamContext {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::queue<std::string> chunks;
+    std::atomic<bool> finished{false};
 };
 
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params, const server_params& sparams) {
@@ -270,6 +280,10 @@ struct whisper_print_user_data {
 
     const std::vector<std::vector<float>> * pcmf32s;
     int progress_prev;
+};
+
+struct whisper_stream_user_data : whisper_print_user_data {
+    const std::shared_ptr<StreamContext> * context;
 };
 
 void check_ffmpeg_availibility() {
@@ -437,6 +451,91 @@ void whisper_print_segment_callback(struct whisper_context * ctx, struct whisper
         }
         fflush(stdout);
     }
+}
+
+void stream_new_segment(struct whisper_context * ctx, struct whisper_state * /*state*/, int n_new, void * user_data) {
+    std::stringstream segment;
+
+    const auto * stream_data = (whisper_stream_user_data *) user_data;
+
+    const auto & params  = *stream_data->params;
+    const auto & pcmf32s = *stream_data->pcmf32s;
+    const auto & context = *stream_data->context;
+
+    const int n_segments = whisper_full_n_segments(ctx);
+
+    std::string speaker = "";
+
+    int64_t t0 = 0;
+    int64_t t1 = 0;
+
+    // print the last n_new segments
+    const int s0 = n_segments - n_new;
+
+    if (s0 == 0) {
+        segment << "\n";
+    }
+
+    for (int i = s0; i < n_segments; i++) {
+        if (!params.no_timestamps || params.diarize) {
+            t0 = whisper_full_get_segment_t0(ctx, i);
+            t1 = whisper_full_get_segment_t1(ctx, i);
+        }
+
+        if (!params.no_timestamps) {
+            segment << "[" << to_timestamp(t0).c_str() << " --> " << to_timestamp(t1).c_str() << "]  ";
+        }
+
+        if (params.diarize && pcmf32s.size() == 2) {
+            speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
+        }
+
+        if (params.print_colors) {
+            for (int j = 0; j < whisper_full_n_tokens(ctx, i); ++j) {
+                if (params.print_special == false) {
+                    const whisper_token id = whisper_full_get_token_id(ctx, i, j);
+                    if (id >= whisper_token_eot(ctx)) {
+                        continue;
+                    }
+                }
+
+                const char * text = whisper_full_get_token_text(ctx, i, j);
+                const float  p    = whisper_full_get_token_p   (ctx, i, j);
+
+                const int col = std::max(0, std::min((int) k_colors.size() - 1, (int) (std::pow(p, 3)*float(k_colors.size()))));
+
+                segment << speaker.c_str() << k_colors[col].c_str() << text << "\033[0m";
+            }
+        } else {
+            const char * text = whisper_full_get_segment_text(ctx, i);
+
+            segment << speaker.c_str() << text;
+        }
+
+        if (params.tinydiarize) {
+            if (whisper_full_get_segment_speaker_turn_next(ctx, i)) {
+                segment << params.tdrz_speaker_turn.c_str();
+            }
+        }
+
+        // with timestamps or speakers: each segment on new line
+        if (!params.no_timestamps || params.diarize) {
+            segment << "\n";
+        }
+
+        printf("stream: %s", segment.str().c_str());
+
+        // Lock and add to queue
+        {
+            std::unique_lock<std::mutex> lock(context->mutex);
+            context->chunks.push(segment.str());
+        }
+        context->cv.notify_one();
+    }
+
+    // Mark as finished
+    context->finished = true;
+    context->cv.notify_one();
 }
 
 std::string output_str(struct whisper_context * ctx, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
@@ -952,152 +1051,78 @@ int main(int argc, char ** argv) {
             };
             wparams.abort_callback_user_data = (void*)&req;
 
-            if (whisper_full_parallel(ctx, wparams, pcmf32.data(), pcmf32.size(), params.n_processors) != 0) {
-                // handle failure or early abort
-                if (req.is_connection_closed()) {
-                    // log client disconnect
-                    fprintf(stderr, "client disconnected, aborted processing\n");
-                    res.status = 499; // Client Closed Request (nginx convention)
-                    res.set_content("{\"error\":\"client disconnected\"}", "application/json");
+            auto context = std::make_shared<StreamContext>();
+            whisper_stream_user_data stream_data = { &params, &pcmf32s, 0, &context };
+            wparams.new_segment_callback_user_data = &stream_data;
+            wparams.new_segment_callback = stream_new_segment;
+
+
+            res.set_chunked_content_provider(
+                "text/plain",
+                [context](size_t /* offset */, httplib::DataSink& sink) {
+                    printf("content provider 1\n");
+                    std::unique_lock<std::mutex> lock(context->mutex);
+                    printf("content provider 2\n");
+
+                    // Wait for chunks or completion
+                    context->cv.wait(lock, [&]() {
+                        return !context->chunks.empty() || context->finished;
+                    });
+
+                    printf("content provider 3\n");
+
+                    // Check if we have chunks
+                    if (!context->chunks.empty()) {
+                        // Get and remove first chunk
+                        std::string chunk = context->chunks.front();
+                        context->chunks.pop();
+
+                        // Write chunk
+                        sink.write(chunk.data(), chunk.size());
+                        return true;
+                    }
+
+                    printf("content provider 4\n");
+
+                    // End of stream if finished and no more chunks
+                    if (context->finished) {
+                        sink.done();
+                        return true;
+                    }
+
+                    printf("content provider 5\n");
+
+                    return true;
+                },
+                [&params, &default_params](bool success) {
+                    params = default_params;
+                }
+            );
+
+
+            // std::async(std::launch::async, [&](){
+            std::thread([&ctx, &wparams, &req, &res, &argv, pcmf32]() {
+                if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
+                    // handle failure or early abort
+                    if (req.is_connection_closed()) {
+                        // log client disconnect
+                        fprintf(stderr, "client disconnected, aborted processing\n");
+                        res.status = 499; // Client Closed Request (nginx convention)
+                        res.set_content("{\"error\":\"client disconnected\"}", "application/json");
+                        return;
+                    }
+                    fprintf(stderr, "%s: failed to process audio\n", argv[0]);
+                    res.status = 500; // Internal Server Error
+                    const std::string error_resp = "{\"error\":\"failed to process audio\"}";
+                    res.set_content(error_resp, "application/json");
                     return;
                 }
-                fprintf(stderr, "%s: failed to process audio\n", argv[0]);
-                res.status = 500; // Internal Server Error
-                const std::string error_resp = "{\"error\":\"failed to process audio\"}";
-                res.set_content(error_resp, "application/json");
-                return;
-            }
+
+                // reset params to their defaults
+                // params = default_params;
+            }).detach();
+
         }
-
-        // return results to user
-        if (params.response_format == text_format)
-        {
-            std::string results = output_str(ctx, params, pcmf32s);
-            res.set_content(results.c_str(), "text/html; charset=utf-8");
-        }
-        else if (params.response_format == srt_format)
-        {
-            std::stringstream ss;
-            const int n_segments = whisper_full_n_segments(ctx);
-            for (int i = 0; i < n_segments; ++i) {
-                const char * text = whisper_full_get_segment_text(ctx, i);
-                const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-                const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-                std::string speaker = "";
-
-                if (params.diarize && pcmf32s.size() == 2)
-                {
-                    speaker = estimate_diarization_speaker(pcmf32s, t0, t1);
-                }
-
-                ss << i + 1 + params.offset_n << "\n";
-                ss << to_timestamp(t0, true) << " --> " << to_timestamp(t1, true) << "\n";
-                ss << speaker << text << "\n\n";
-            }
-            res.set_content(ss.str(), "application/x-subrip");
-        } else if (params.response_format == vtt_format) {
-            std::stringstream ss;
-
-            ss << "WEBVTT\n\n";
-
-            const int n_segments = whisper_full_n_segments(ctx);
-            for (int i = 0; i < n_segments; ++i) {
-                const char * text = whisper_full_get_segment_text(ctx, i);
-                const int64_t t0 = whisper_full_get_segment_t0(ctx, i);
-                const int64_t t1 = whisper_full_get_segment_t1(ctx, i);
-                std::string speaker = "";
-
-                if (params.diarize && pcmf32s.size() == 2)
-                {
-                    speaker = estimate_diarization_speaker(pcmf32s, t0, t1, true);
-                    speaker.insert(0, "<v Speaker");
-                    speaker.append(">");
-                }
-
-                ss << to_timestamp(t0) << " --> " << to_timestamp(t1) << "\n";
-                ss << speaker << text << "\n\n";
-            }
-            res.set_content(ss.str(), "text/vtt");
-        } else if (params.response_format == vjson_format) {
-            /* try to match openai/whisper's Python format */
-            std::string results = output_str(ctx, params, pcmf32s); 
-            // Get language probabilities
-            std::vector<float> lang_probs(whisper_lang_max_id() + 1, 0.0f);
-            const auto detected_lang_id = whisper_lang_auto_detect(ctx, 0, params.n_threads, lang_probs.data());
-            json jres = json{
-                {"task", params.translate ? "translate" : "transcribe"},
-                {"language", whisper_lang_str_full(whisper_full_lang_id(ctx))},
-                {"duration", float(pcmf32.size())/WHISPER_SAMPLE_RATE},
-                {"text", results},
-                {"segments", json::array()},
-                {"detected_language", whisper_lang_str_full(detected_lang_id)},
-                {"detected_language_probability", lang_probs[detected_lang_id]},
-                {"language_probabilities", json::object()}
-            };
-            // Add all language probabilities
-            for (int i = 0; i <= whisper_lang_max_id(); ++i) {
-                if (lang_probs[i] > 0.001f) { // Only include non-negligible probabilities
-                    jres["language_probabilities"][whisper_lang_str(i)] = lang_probs[i];
-                }
-            }
-            const int n_segments = whisper_full_n_segments(ctx);
-            for (int i = 0; i < n_segments; ++i)
-            {
-                json segment = json{
-                    {"id", i},
-                    {"text", whisper_full_get_segment_text(ctx, i)},
-                };
-
-                if (!params.no_timestamps) {
-                    segment["start"] = whisper_full_get_segment_t0(ctx, i) * 0.01;
-                    segment["end"] = whisper_full_get_segment_t1(ctx, i) * 0.01;
-                }
-
-                float total_logprob = 0;
-                const int n_tokens = whisper_full_n_tokens(ctx, i);
-                for (int j = 0; j < n_tokens; ++j) {
-                    whisper_token_data token = whisper_full_get_token_data(ctx, i, j);
-                    if (token.id >= whisper_token_eot(ctx)) {
-                        continue;
-                    }
-
-                    segment["tokens"].push_back(token.id);
-                    json word = json{{"word", whisper_full_get_token_text(ctx, i, j)}};
-                    if (!params.no_timestamps) {
-                        word["start"] = token.t0 * 0.01;
-                        word["end"] = token.t1 * 0.01;
-                        word["t_dtw"] = token.t_dtw;
-                    }
-                    word["probability"] = token.p;
-                    total_logprob += token.plog;
-                    segment["words"].push_back(word);
-                }
-
-                segment["temperature"] = params.temperature;
-                segment["avg_logprob"] = total_logprob / n_tokens;
-
-                // TODO compression_ratio and no_speech_prob are not implemented yet
-                // segment["compression_ratio"] = 0;
-                segment["no_speech_prob"] = whisper_full_get_segment_no_speech_prob(ctx, i);
-
-                jres["segments"].push_back(segment);
-            }
-            res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
-                            "application/json");
-        }
-        // TODO add more output formats
-        else
-        {
-            std::string results = output_str(ctx, params, pcmf32s);
-            json jres = json{
-                {"text", results}
-            };
-            res.set_content(jres.dump(-1, ' ', false, json::error_handler_t::replace),
-                            "application/json");
-        }
-
-        // reset params to their defaults
-        params = default_params;
     });
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
         std::lock_guard<std::mutex> lock(whisper_mutex);
@@ -1188,9 +1213,6 @@ int main(int argc, char ** argv) {
     // Set the base directory for serving static files
     svr->set_base_dir(sparams.public_path);
 
-    // to make it ctrl+clickable:
-    printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
-
     shutdown_handler = [&](int signal) {
         printf("\nCaught signal %d, shutting down gracefully...\n", signal);
         if (svr) {
@@ -1223,6 +1245,9 @@ int main(int argc, char ** argv) {
             fprintf(stderr, "error: server listen failed\n");
         }
     });
+
+    // to make it ctrl+clickable:
+    printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
 
     svr->wait_until_ready();
 
