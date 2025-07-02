@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstdio>
 #include <fstream>
-#include <future>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -131,13 +130,6 @@ struct whisper_params {
     float       vad_max_speech_duration_s = FLT_MAX;
     int         vad_speech_pad_ms = 30;
     float       vad_samples_overlap = 0.1f;
-};
-
-struct StreamContext {
-    std::mutex mutex;
-    std::condition_variable cv;
-    std::queue<std::string> chunks;
-    std::atomic<bool> finished{false};
 };
 
 void whisper_print_usage(int /*argc*/, char ** argv, const whisper_params & params, const server_params& sparams) {
@@ -282,8 +274,10 @@ struct whisper_print_user_data {
     int progress_prev;
 };
 
+class Transcriber;
+
 struct whisper_stream_user_data : whisper_print_user_data {
-    const std::shared_ptr<StreamContext> * context;
+    Transcriber * context;
 };
 
 void check_ffmpeg_availibility() {
@@ -453,18 +447,121 @@ void whisper_print_segment_callback(struct whisper_context * ctx, struct whisper
     }
 }
 
+void stream_new_segment(struct whisper_context * ctx, struct whisper_state * /*state*/, int n_new, void * user_data);
+
+class Transcriber {
+private:
+    struct whisper_context * ctx;
+    struct whisper_full_params params;
+    const float * samples;
+    int n_samples;
+
+    std::queue<std::string> chunk_queue;
+    std::mutex queue_mutex;
+    std::condition_variable cv;
+    std::atomic<bool> is_finished{false};
+    std::atomic<bool> stop_generation{false};
+
+    void transcribe() {
+        try {
+            if (whisper_full(ctx, params, samples, n_samples) != 0) {
+                fprintf(stderr, "failed to process audio\n");
+                throw std::runtime_error("failed to process audio");
+            }
+
+            printf("Done transcribing.\n");
+        }
+        catch (const std::exception& e) {
+            std::cerr << "Transcription error: " << e.what() << std::endl;
+            is_finished = true;
+            cv.notify_one();
+        }
+    }
+
+    bool getNextData(std::string& data) {
+        printf("Transcriber::getNextData\n");
+        std::unique_lock<std::mutex> lock(queue_mutex);
+
+        // wait for data if queue is empty
+        cv.wait(lock, [this]{ return !chunk_queue.empty() || stop_generation; });
+
+        if (!chunk_queue.empty()) {
+            data = chunk_queue.front();
+            chunk_queue.pop();
+            return true;
+        }
+        return false;
+    }
+
+public:
+
+    Transcriber(
+                struct whisper_context * ctx,
+            struct whisper_full_params   params,
+                           const float * samples,
+                                   int   n_samples
+    ) :
+        ctx(ctx),
+        params(params),
+        samples(samples),
+        n_samples(n_samples)
+    {
+        this->params.new_segment_callback = &Transcriber::handleSegment;
+        auto& user_data = *(whisper_stream_user_data *) params.new_segment_callback_user_data;
+
+        user_data.context = this;
+    }
+
+    void start() {
+        std::thread(&Transcriber::transcribe, this).detach();
+    }
+
+    void stop() {
+        stop_generation = true;
+        cv.notify_one();
+    }
+
+    static void handleSegment(struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data) {
+        printf("Transcriber::handleSegment\n");
+        stream_new_segment(ctx, state, n_new, user_data);
+    }
+
+    void publishSegment(std::string segment) {
+        printf("Transcriber::publishSegment\n");
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        chunk_queue.push(segment);
+        cv.notify_one();
+    }
+
+    bool stream(httplib::DataSink& sink) {
+        printf("Transcriber::stream\n");
+        while (true) {
+            std::string data;
+            if (getNextData(data)) {
+                if (!sink.write(data.data(), data.length())) {
+                    printf("Connection closed\n");
+                    // Connection closed
+                    return false;
+                }
+            }
+
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return true;
+    }
+
+};
+
 void stream_new_segment(struct whisper_context * ctx, struct whisper_state * /*state*/, int n_new, void * user_data) {
-    std::stringstream segment;
+    printf("stream_new_segment 1\n");
 
-    const auto * stream_data = (whisper_stream_user_data *) user_data;
+    const auto& params  = *((whisper_stream_user_data *) user_data)->params;
+    const auto& pcmf32s = *((whisper_stream_user_data *) user_data)->pcmf32s;
+    auto& transcriber = *((whisper_stream_user_data *) user_data)->context;
 
-    const auto & params  = *stream_data->params;
-    const auto & pcmf32s = *stream_data->pcmf32s;
-    const auto & context = *stream_data->context;
+    printf("stream_new_segment 2\n");
 
     const int n_segments = whisper_full_n_segments(ctx);
-
-    std::string speaker = "";
 
     int64_t t0 = 0;
     int64_t t1 = 0;
@@ -472,11 +569,13 @@ void stream_new_segment(struct whisper_context * ctx, struct whisper_state * /*s
     // print the last n_new segments
     const int s0 = n_segments - n_new;
 
-    if (s0 == 0) {
-        segment << "\n";
-    }
+    std::stringstream segment;
+    std::string speaker;
 
     for (int i = s0; i < n_segments; i++) {
+        segment.str("");
+        speaker = "";
+
         if (!params.no_timestamps || params.diarize) {
             t0 = whisper_full_get_segment_t0(ctx, i);
             t1 = whisper_full_get_segment_t1(ctx, i);
@@ -523,19 +622,10 @@ void stream_new_segment(struct whisper_context * ctx, struct whisper_state * /*s
             segment << "\n";
         }
 
-        printf("stream: %s", segment.str().c_str());
+        printf("stream: %s\n", segment.str().c_str());
 
-        // Lock and add to queue
-        {
-            std::unique_lock<std::mutex> lock(context->mutex);
-            context->chunks.push(segment.str());
-        }
-        context->cv.notify_one();
+        transcriber.publishSegment(segment.str());
     }
-
-    // Mark as finished
-    context->finished = true;
-    context->cv.notify_one();
 }
 
 std::string output_str(struct whisper_context * ctx, const whisper_params & params, std::vector<std::vector<float>> pcmf32s) {
@@ -884,7 +974,7 @@ int main(int argc, char ** argv) {
 
     svr->Post(sparams.request_path + sparams.inference_path, [&](const Request &req, Response &res){
         // acquire whisper model mutex lock
-        std::lock_guard<std::mutex> lock(whisper_mutex);
+        // std::lock_guard<std::mutex> lock(whisper_mutex);
 
         // first check user requested fields of the request
         if (!req.has_file("file"))
@@ -1051,77 +1141,20 @@ int main(int argc, char ** argv) {
             };
             wparams.abort_callback_user_data = (void*)&req;
 
-            auto context = std::make_shared<StreamContext>();
-            whisper_stream_user_data stream_data = { &params, &pcmf32s, 0, &context };
-            wparams.new_segment_callback_user_data = &stream_data;
-            wparams.new_segment_callback = stream_new_segment;
-
+            auto transcriber = std::make_shared<Transcriber>(ctx, wparams, pcmf32.data(), pcmf32.size());
+            transcriber->start();
 
             res.set_chunked_content_provider(
                 "text/plain",
-                [context](size_t /* offset */, httplib::DataSink& sink) {
-                    printf("content provider 1\n");
-                    std::unique_lock<std::mutex> lock(context->mutex);
-                    printf("content provider 2\n");
-
-                    // Wait for chunks or completion
-                    context->cv.wait(lock, [&]() {
-                        return !context->chunks.empty() || context->finished;
-                    });
-
-                    printf("content provider 3\n");
-
-                    // Check if we have chunks
-                    if (!context->chunks.empty()) {
-                        // Get and remove first chunk
-                        std::string chunk = context->chunks.front();
-                        context->chunks.pop();
-
-                        // Write chunk
-                        sink.write(chunk.data(), chunk.size());
-                        return true;
-                    }
-
-                    printf("content provider 4\n");
-
-                    // End of stream if finished and no more chunks
-                    if (context->finished) {
-                        sink.done();
-                        return true;
-                    }
-
-                    printf("content provider 5\n");
-
-                    return true;
+                [transcriber](size_t /* offset */, httplib::DataSink& sink) {
+                    printf("set_chunked_content_provider\n");
+                    return transcriber->stream(sink);
                 },
-                [&params, &default_params](bool success) {
+                [transcriber, &params, &default_params](bool success) {
+                    transcriber->stop();
                     params = default_params;
                 }
             );
-
-
-            // std::async(std::launch::async, [&](){
-            std::thread([&ctx, &wparams, &req, &res, &argv, pcmf32]() {
-                if (whisper_full(ctx, wparams, pcmf32.data(), pcmf32.size()) != 0) {
-                    // handle failure or early abort
-                    if (req.is_connection_closed()) {
-                        // log client disconnect
-                        fprintf(stderr, "client disconnected, aborted processing\n");
-                        res.status = 499; // Client Closed Request (nginx convention)
-                        res.set_content("{\"error\":\"client disconnected\"}", "application/json");
-                        return;
-                    }
-                    fprintf(stderr, "%s: failed to process audio\n", argv[0]);
-                    res.status = 500; // Internal Server Error
-                    const std::string error_resp = "{\"error\":\"failed to process audio\"}";
-                    res.set_content(error_resp, "application/json");
-                    return;
-                }
-
-                // reset params to their defaults
-                // params = default_params;
-            }).detach();
-
         }
     });
     svr->Post(sparams.request_path + "/load", [&](const Request &req, Response &res){
@@ -1240,14 +1273,14 @@ int main(int argc, char ** argv) {
         whisper_free(ctx);
     };
 
+    // to make it ctrl+clickable:
+    printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
+
     std::thread t([&] {
         if (!svr->listen_after_bind()) {
             fprintf(stderr, "error: server listen failed\n");
         }
     });
-
-    // to make it ctrl+clickable:
-    printf("\nwhisper server listening at http://%s:%d\n\n", sparams.hostname.c_str(), sparams.port);
 
     svr->wait_until_ready();
 
