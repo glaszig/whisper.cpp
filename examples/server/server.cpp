@@ -462,6 +462,8 @@ private:
     std::atomic<bool> is_finished{false};
     std::atomic<bool> stop_generation{false};
 
+    std::thread thread;
+
     void transcribe() {
         try {
             if (whisper_full(ctx, params, samples, n_samples) != 0) {
@@ -513,12 +515,13 @@ public:
     }
 
     void start() {
-        std::thread(&Transcriber::transcribe, this).detach();
+        thread = std::thread(&Transcriber::transcribe, this);
     }
 
     void stop() {
         stop_generation = true;
         cv.notify_one();
+        thread.join();
     }
 
     static void handleSegment(struct whisper_context * ctx, struct whisper_state * state, int n_new, void * user_data) {
